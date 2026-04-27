@@ -2,69 +2,56 @@
 
 This repository contains an enterprise-grade backend implementation of an Idempotency Layer for FinSafe Transactions Ltd. It ensures that network retries do not result in double-charging customers, even under high concurrency and failure scenarios.
 
+---
 
-
-##  Architecture & Resilience Logic
+## 🏗 Architecture & Resilience Logic
 
 This implementation goes beyond basic idempotency by handling race conditions, wait timeouts, and failure scenarios.
 
-```mermaid
-sequenceDiagram
-    actor Client
-    participant Controller as API Layer (Validation)
-    participant I_Service as IdempotencyService
-    participant Cache as InMemoryStore
-    participant P_Service as PaymentService
+![Sequence Diagram](image/amalitech_sequence%20diagram.png)
 
-    Client->>Controller: POST /process-payment (Idempotency-Key, Payload)
-    Note over Controller: Validates payload & key
-    
-    Controller->>I_Service: process(Key, Payload)
-    I_Service->>I_Service: SHA-256 Hashing of Payload
-    I_Service->>Cache: putIfAbsent(Key, IN_PROGRESS)
-    
-    alt Key is NEW (Happy Path)
-        Cache-->>I_Service: null (Lock Acquired — record inserted)
-        I_Service->>P_Service: execute()
-        
-        alt Payment Success
-            P_Service-->>I_Service: PaymentResponse
-            I_Service->>I_Service: record.completeWith(response)
-            Note over Cache: CountDownLatch released
-            I_Service-->>Controller: Return Response
-        else Payment Fails
-            P_Service-->>I_Service: Throw Exception
-            I_Service->>I_Service: record.failWith(error)
-            Note over Cache: CountDownLatch released
-            I_Service->>Cache: repository.remove(Key)
-            I_Service-->>Controller: Propagate Exception
-        end
-        
-        Controller-->>Client: 201 Created or 500 Error
-        
-    else Key EXISTS (Duplicate / In-Flight)
-        Cache-->>I_Service: Returns Existing Record
-        I_Service->>I_Service: Verify SHA-256 Hash Match
-        
-        alt Hash Mismatch
-            I_Service-->>Controller: Throw IdempotencyConflictException
-            Controller-->>Client: 422 Unprocessable Entity
-        else Same Payload — await CountDownLatch
-            Note over I_Service: awaitCompletion(timeout: 5s)
-            alt Primary succeeded
-                I_Service-->>Controller: Return Replayed Result
-                Controller-->>Client: 200 OK (X-Cache-Hit: true)
-            else Primary failed
-                I_Service-->>Controller: Throw RuntimeException
-                Controller-->>Client: 500 Error ("Previous attempt failed")
-            end
-        end
-    end
-```
+### Diagram Participants
 
+| Participant | Role |
+|---|---|
+| **Client** | The e-commerce system sending payment requests |
+| **API Layer (Validation)** | Spring `@RestController` — validates headers and request body before any logic runs |
+| **IdempotencyService** | Core orchestrator — owns all idempotency decisions |
+| **InMemoryStore (ConcurrentHashMap)** | Thread-safe key-value store holding one `IdempotencyRecord` per idempotency key |
+| **PaymentService** | Simulates an external payment provider with a 2-second processing delay |
 
+### How to Read the Diagram
 
-##  Setup & Execution
+The diagram covers **four distinct scenarios** depending on whether the key is new or already exists:
+
+**Scenario 1 — Happy Path (new key, payment succeeds)**
+The client sends a request with a fresh `Idempotency-Key`. `putIfAbsent` returns `null`, confirming the lock is acquired. `PaymentService` processes the payment, `record.completeWith(response)` is called which releases the `CountDownLatch`, and a `201 Created` is returned.
+
+**Scenario 2 — Payment Failure (new key, payment fails)**
+Same entry path as Scenario 1, but `PaymentService` throws an exception. `record.failWith(error)` releases the latch so any waiting threads are unblocked, and `repository.remove(key)` deletes the record immediately so the client can retry safely with the same key. A `500` error is returned.
+
+**Scenario 3 — Payload Mismatch (existing key, different body)**
+The key already exists in the store. `IdempotencyService` compares the SHA-256 hash of the incoming payload against the stored hash. They differ, so an `IdempotencyConflictException` is thrown and a `422 Unprocessable Entity` is returned. No payment is processed.
+
+**Scenario 4 — In-Flight / Duplicate Request (existing key, same body)**
+The key exists and the hashes match. The duplicate thread calls `record.awaitCompletion(5, SECONDS)`, blocking on the `CountDownLatch` until the primary request finishes. Three outcomes are possible:
+- Primary **succeeded** → duplicate receives the replayed response with `X-Cache-Hit: true` header (`201 Created`)
+- Primary **failed** → duplicate receives `"Previous attempt failed: ..."` (`500`)
+- **Timeout exceeded** (primary took longer than 5 seconds) → duplicate receives `"Gateway timeout waiting for payment processing."` (`500`)
+
+### Key Technical Mechanisms
+
+| Mechanism | Where in diagram | Purpose |
+|---|---|---|
+| `putIfAbsent` | `I_Service → Cache` | Atomic insertion — guarantees only one thread becomes the primary processor |
+| `SHA-256` hash | `I_Service → I_Service` | Payload fingerprint used to detect same vs different body on duplicate keys |
+| `CountDownLatch(1)` | `record.completeWith` / `record.failWith` | Blocks duplicate threads until the primary finishes, then releases all at once |
+| `repository.remove(key)` | After payment failure | Clears the failed record so the client can retry with the same key |
+| 5-second timeout | `awaitCompletion` | Prevents thread starvation if the primary hangs indefinitely |
+
+---
+
+## 🚀 Setup & Execution
 
 ### Prerequisites
 - Java 17+
@@ -81,9 +68,9 @@ The server starts on `http://localhost:8080`.
 mvn test
 ```
 
+---
 
-
-##  API Documentation
+## 📖 API Documentation
 
 ### `POST /process-payment`
 
@@ -108,7 +95,7 @@ Processes a simulated payment with idempotency guarantees.
 | Scenario | Status | Body Schema |
 |---|---|---|
 | New payment processed | `201 Created` | `{ "status": "Charged 100 GHS" }` |
-| Duplicate request replayed | `200 OK` | `{ "status": "Charged 100 GHS" }` |
+| Duplicate request replayed | `201 Created` | `{ "status": "Charged 100 GHS" }` |
 | Payload mismatch on existing key | `422 Unprocessable Entity` | `{ "error": "Idempotency key already used for a different request body." }` |
 | Missing or invalid fields | `400 Bad Request` | `{ "error": "<field>: <validation message>" }` |
 | Missing Idempotency-Key header | `400 Bad Request` | `{ "error": "Required header missing: Idempotency-Key" }` |
@@ -119,7 +106,7 @@ Processes a simulated payment with idempotency guarantees.
 |---|---|---|
 | `X-Cache-Hit` | `true` | Only on replayed (cached) responses |
 
-
+---
 
 ### Example 1 — First Request (Happy Path)
 
@@ -135,7 +122,7 @@ curl -X POST http://localhost:8080/process-payment \
 {"status": "Charged 100 GHS"}
 ```
 
-
+---
 
 ### Example 2 — Duplicate Request (Same Key, Same Body)
 
@@ -146,12 +133,12 @@ curl -X POST http://localhost:8080/process-payment \
   -d '{"amount": 100, "currency": "GHS"}'
 ```
 
-**Response — `200 OK`** with response header `X-Cache-Hit: true` and no 2-second processing delay.
+**Response — `201 Created`** with response header `X-Cache-Hit: true` and no 2-second processing delay.
 ```json
 {"status": "Charged 100 GHS"}
 ```
 
-
+---
 
 ### Example 3 — Conflict (Same Key, Different Body)
 
@@ -167,7 +154,7 @@ curl -X POST http://localhost:8080/process-payment \
 {"error": "Idempotency key already used for a different request body."}
 ```
 
-
+---
 
 ### Example 4 — Missing Header
 
@@ -182,9 +169,9 @@ curl -X POST http://localhost:8080/process-payment \
 {"error": "Required header missing: Idempotency-Key"}
 ```
 
+---
 
-
-##  Enterprise Design Decisions
+## 🧠 Enterprise Design Decisions
 
 - **Thread Safety (`ConcurrentHashMap` + `putIfAbsent`)**: The store uses a `ConcurrentHashMap`. The `putIfAbsent` operation is atomic — it guarantees that even if ten threads arrive simultaneously with the same key, exactly one will insert and become the primary processor. All others will receive the existing record and wait.
 
@@ -200,7 +187,7 @@ curl -X POST http://localhost:8080/process-payment \
 
 ---
 
-##  The Developer's Choice: Automated TTL Cache Eviction
+## 🛠 The Developer's Choice: Automated TTL Cache Eviction
 
 **Feature Added**: Scheduled background cache sweeper using `@Scheduled(fixedRate = 3600000)`.
 
@@ -212,7 +199,7 @@ curl -X POST http://localhost:8080/process-payment \
 
 ---
 
-##  Test Coverage
+## 🧪 Test Coverage
 
 ### `GatewayApplicationTests`
 Smoke test that verifies the full Spring application context loads without errors.
