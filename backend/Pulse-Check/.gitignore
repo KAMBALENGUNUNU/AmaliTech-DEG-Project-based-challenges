@@ -26,8 +26,13 @@ target/
 /nbdist/
 /.nb-gradle/
 build/
+*.DS_Store
 !**/src/main/**/build/
 !**/src/test/**/build/
 
 ### VS Code ###
 .vscode/
+
+# Environment files
+.env
+*.env.local
